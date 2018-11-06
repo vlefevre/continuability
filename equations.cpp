@@ -12,17 +12,23 @@ using namespace std;
 #define RIGID    100
 #define MOLDABLE 200
 #define GRID     300
-#define NBMODELS 3
+#define ABFT	 400
+#define NBMODELS 4
 
-static int models[NBMODELS] = { 100, 200, 300 };
+static int models[NBMODELS] = { 100, 200, 300, 400 };
 
 struct Params
 {
     int    model;
-	int    P;
+	int    P; //allocation size
 	double MTBF;
 	double waittime;
-	double C;
+	double C; //size of ckpt with all procs
+	double b; //size of tiles
+	double r; //sqrt(number of tiles per proc)
+	double ta; //floating-point computation speed
+	double tc; //floating-point communication speed = bandwidth
+	double BW; //Bandwidth between PFS and nodes
 };
 
 static string modelname(int model)
@@ -33,6 +39,8 @@ static string modelname(int model)
         return string("RIGID");
     if( GRID == model )
         return string("GRID");
+    if( ABFT == model )
+	return string("ABFT");
     return string("");
 }
 
@@ -57,20 +65,17 @@ static double mu(int n, const Params& p)
 
 static double C(int i,const Params& p)
 {
-	return p.C;
+	return p.C;//*(double)(p.P)/(double)(i);
 }
 
 static double rigidTime(int F, const Params& p)
 {
 	double result = 0;
-	double result2 = 0;
 	for (int i=p.P; i>=p.P-F; i--)
 	{
 		result += mu(i,p);
-		result2 += (double)(p.P-F)/(double)(i)*(C(p.P-F,p)+sqrt(2*C(p.P-F,p)*mu(p.P-F,p))/2);
 	}
-	//cout << result << " " << result2 << "\n";
-	result += p.waittime + result2;
+	result += p.waittime;
 	return result;
 }
 
@@ -79,9 +84,9 @@ static double rigidWork(int F, const Params& p)
 	double result = 0;
 	for (int i=p.P; i>=p.P-F; i--)
 	{
-		result += mu(i,p)*(1-C(p.P-F,p)/sqrt(2*C(p.P-F,p)*mu(p.P-F,p)));
+		result += mu(i,p)-(double)(p.P-F)/(double)i*(C(p.P-F,p)+sqrt(2*C(p.P-F,p)*mu(p.P-F,p))/2); //remove restart time and lost work
 	}
-	return result*(p.P-F);
+	return result*(p.P-F)/(1+C(p.P-F,p)/sqrt(2*C(p.P-F,p)*mu(p.P-F,p))); //account for checkpoints during effective compute time and multiply by number of working processors
 }
 
 static double rigidYield(int Q, const Params& p)
@@ -130,6 +135,7 @@ static pair<int, double> findMax(const Params& p, double (*yield_fn)(int i, cons
 
     for (int i = lower; i < upper; i++) {
         double v = yield_fn(i, p);
+	//cout << "v=" << v << "\n";
         assert( v >= 0.0 );
         assert( v <= 1.0 );
         if( v > m ) {
@@ -210,17 +216,7 @@ static void plot(const Params& p, double (*yield_fn)(int i, const Params &p))
 
 static double moldableTime(int F, const Params& p)
 {
-	double result = 0;
-	double result2 = 0;
-	for (int i=p.P; i>p.P-F; i--)
-	{
-		result += mu(i,p);
-		result2 += C(i,p) + (double)i/(double)(i-1)*sqrt(2*C(i,p)*mu(i,p))/2;
-	}
-	//cout << result << " " << result2 << "\n";
-	//last iteration is different:
-	result += mu(p.P-F,p) + C(p.P,p) + (double)(p.P-F)/(double)p.P*sqrt(2*C(p.P-F,p)*mu(p.P-F,p))/2 + p.waittime + result2;
-	return result;
+	return rigidTime(F,p);
 }
 
 static double moldableWork(int F, const Params& p)
@@ -228,7 +224,7 @@ static double moldableWork(int F, const Params& p)
 	double result = 0;
 	for (int i=p.P; i>=p.P-F; i--)
 	{
-		result += mu(i,p)*(1-C(i,p)/sqrt(2*C(i,p)*mu(i,p)))*i;
+		result += (mu(i,p)-C(i,p)-sqrt(2*C(i,p)*mu(i,p))/2)*i/(1+C(i,p)/sqrt(2*C(i,p)*mu(i,p))); //remove restart and time lost, multiply by number of procs, divide by ckpt overhead
 	}
 	return result;
 }
@@ -242,7 +238,12 @@ static double moldableYield(int L, const Params& p)
 
 static double C(int P, int Q, const Params& p)
 {
-	return p.C;
+	return p.C;//*(double)(p.P)/(double)(P*Q);
+}
+
+static double gridTime(int F, const Params& p)
+{
+	return rigidTime(F,p);
 }
 
 static double gridWork(int F, const Params& p)
@@ -250,11 +251,23 @@ static double gridWork(int F, const Params& p)
 	int p1 = sqrt(p.P);
 	int p2 = sqrt(p.P);
 	int spares = 0;
+	bool sizeChange = false;
 	
-	double result = 0;
-	for (int i=0; i<=F; i++)
+	double result = (mu(p.P,p)-C(p.P,p)-sqrt(2*C(p.P,p)*mu(p.P,p))/2)*p.P/(1+C(p.P,p)/sqrt(2*C(p.P,p)*mu(p.P,p)));
+	p1--;
+	spares = p2-1;
+	sizeChange = true;
+	for (int i=1; i<=F; i++)
 	{
-		result += mu(p.P-i,p)*(1-C(p1,p2,p)/sqrt(2*C(p1,p2,p)*mu(p1*p2,p)))*(p1*p2);
+		if (sizeChange) {
+			result += (mu(p.P-i,p)-C(p1*p2,p)
+				-sqrt(2*C(p1*p2,p)*mu(p1*p2,p))/2*((double)p1*p2/(double)(p.P-i)))*p1*p2/(1+C(p1*p2,p)/sqrt(2*C(p1*p2,p)*mu(p1*p2,p)));
+			sizeChange = false;
+		} else {
+			result += (mu(p.P-i,p)
+				-C(p1*p2,p)*((double)p1*p2/(double)(p.P-i+1))
+				-sqrt(2*C(p1*p2,p)*mu(p1*p2,p))/2*((double)p1*p2/(double)(p.P-i)))*p1*p2/(1+C(p1*p2,p)/sqrt(2*C(p1*p2,p)*mu(p1*p2,p)));
+		}
 		if (spares == 0)
 		{
 			if (p1 < p2)
@@ -265,46 +278,11 @@ static double gridWork(int F, const Params& p)
 				spares = p2-1;
 				p1--;
 			}
+			sizeChange = true;
 		} else {
 			spares--;
 		}
 	}
-
-	return result;
-}
-
-static double gridTime(int F, const Params& p)
-{
-	int p1 = sqrt(p.P);
-	int p2 = sqrt(p.P);
-	int spares = 0;
-	
-	double result = 0;
-	for (int i=0; i<F; i++)
-	{
-		result += mu(p.P-i,p);
-		if (spares == 0)
-		{
-			if (p1 < p2)
-			{
-				result += C(p1,p2-1,p) + (double)p2/(double)(p2-1)*sqrt(2*C(p1,p2,p)*mu(p1*p2,p))/2;
-				spares = p1-1;
-				p2--;
-                                //cout << "u_2i+2 = " << i+1 << "\n";
-			} else {
-				result += C(p1-1,p2,p) + (double)p1/(double)(p1-1)*sqrt(2*C(p1,p2,p)*mu(p1*p2,p))/2;
-				spares = p2-1;
-				p1--;
-                                //cout << "u_2i+1 = " << i+1 << "\n";
-			}
-		} else {
-			result += (double)(p1*p2)/(double)(p.P-i)*(C(p1,p2,p)+sqrt(2*C(p1,p2,p)*mu(p1*p2,p))/2);
-			spares--;
-		}
-	}
-	//need to check
-	result += mu(p.P-F,p) + p.waittime + C(sqrt(p.P),sqrt(p.P),p) + (double)(p1*p2)/(double)(p.P)*(sqrt(2*C(p1,p2,p)*mu(p1*p2,p))/2);
-
 	return result;
 }
 
@@ -312,6 +290,69 @@ static double gridYield(int L, const Params& p)
 {
 	double w = gridWork(L,p);
 	double t = gridTime(L,p);
+	return w/(p.P*t);
+}
+
+static double redistribute(int size, const Params& p)
+{
+	double n = p.b*p.r*sqrt(p.P);
+	return (p.r*p.r*p.b*p.b*(1.5*p.b+sqrt(p.P))*p.ta + 8*n*n/size*p.tc)/1024/1024/1024; //convert to seconds
+}
+
+static double replace(const Params& p)
+{
+	return p.r*p.r*p.b*p.b*((1.5*p.b+sqrt(p.P))*p.ta + 8*p.tc)/1024/1024/1024; //convert to seconds
+}
+
+static double abftTime(int F, const Params& p)
+{
+	return rigidTime(F,p);
+}
+
+static double abftWork(int F, const Params& p)
+{
+	int p1 = sqrt(p.P);
+	int p2 = sqrt(p.P);
+	int spares = 0;
+	bool sizeChange = false;
+	
+	double result = (mu(p.P,p)-C(p.P,p))*p.P/(1+2.0/(double)sqrt(p.P));
+	p1--;
+	spares = p2-1;
+	sizeChange = true;
+	for (int i=1; i<=F; i++)
+	{
+		if (spares == p2-1 && sizeChange) {
+			result += (mu(p.P-i,p)-redistribute(p1,p))*p1*p2/(1+2.0/(double)sqrt(p.P));
+			sizeChange = false;
+		} else if (spares == p1-1 && sizeChange) {
+			result += (mu(p.P-i,p)-redistribute(p2,p))*p1*p2/(1+2.0/(double)sqrt(p.P));
+			sizeChange = false;
+		} else {
+			result += (mu(p.P-i,p)-replace(p)*(double)(p1*p2)/(double)(p.P-i+1))*p1*p2/(1+2.0/(double)sqrt(p.P));
+		}
+		if (spares == 0)
+		{
+			if (p1 < p2)
+			{
+				spares = p1-1;
+				p2--;
+			} else {
+				spares = p2-1;
+				p1--;
+			}
+			sizeChange = true;
+		} else {
+			spares--;
+		}
+	}
+	return result;
+}
+
+static double abftYield(int L, const Params& p)
+{
+	double w = abftWork(L,p);
+	double t = abftTime(L,p);
 	return w/(p.P*t);
 }
 
@@ -325,8 +366,10 @@ static void waittime_expe(Params& orig)
     for(unsigned int j = 0; j < NBMODELS; j++) {
         cout << "," << modelname(models[j]) << "_F," << modelname(models[j]) << "_Yield," << modelname(models[j]) << "_Work," << modelname(models[j]) << "_Time";
     }
-    cout << ",NO_Yield,NO_Work,NO_Time" << std::endl;
-	for (int i=1; i<=120; i++)
+    cout << ",NO_Yield,NO_Work,NO_Time";
+    cout << ",NO_AbftYield,NO_AbftWork,NO_AbftTime";
+    cout << std::endl;
+	for (int i=1; i<=240; i++)
 	{
         cout << p.waittime;
         for(unsigned int j = 0; j < NBMODELS; j++ ) {
@@ -339,6 +382,8 @@ static void waittime_expe(Params& orig)
                 res = findMax(p, moldableYield);
             else if (p.model == GRID)
                 res = findMax(p, gridYield);
+	    else if (p.model == ABFT)
+		res = findMax(p, abftYield);
             cout << "," << res.first << "," << res.second;
 
             if (p.model == RIGID)
@@ -347,12 +392,16 @@ static void waittime_expe(Params& orig)
                 cout << "," << moldableWork(res.first, p) << "," << moldableTime(res.first, p);
             else if (p.model == GRID)
                 cout << "," << gridWork(res.first, p) << "," << gridTime(res.first, p);
+            else if (p.model == ABFT)
+                cout << "," << abftWork(res.first, p) << "," << abftTime(res.first, p);
         }
-        assert( fabs(rigidWork(0, p) - moldableWork(0, p)) < 1e-10 );
-        assert( fabs(rigidYield(0, p) - moldableYield(0, p)) < 1e-10);
-        cout << "," << moldableYield(0, p) << "," << moldableWork(0, p) << "," << moldableTime(0, p) << std::endl;
+        assert( fabs(rigidWork(0, p) - moldableWork(0, p)) < 1e-06 );
+        assert( fabs(rigidYield(0, p) - moldableYield(0, p)) < 1e-06);
+        cout << "," << rigidYield(0, p) << "," << rigidWork(0, p) << "," << rigidTime(0, p);
+	cout << "," << abftYield(0,p) << "," << abftWork(0,p) << "," << abftTime(0,p);
+	cout << std::endl;
 
-		p.waittime += 600;
+		p.waittime += 300;
 	}
 }
 
@@ -615,8 +664,19 @@ int main(int argc, char **argv)
 	p.P = 150*150;
 	p.MTBF = 20*365.25*24*3600;
 	p.waittime = 3600*12;
-	p.C = 120;
+
+	p.tc = 1.0/5.45; //in s/Go, 1024^3 is added in the computation to avoid double approximations
+	p.ta = 1.0/10.4; //in s/Gflop, same
+	p.b = 180;
+	p.r = 81;
+	p.BW = 160; //Go/s
+
+	p.C = (p.b*p.b*p.r*p.r*8.0/1024/1024/1024)*p.P/p.BW; //Go / (Go/s) = s
+	//p.C = 120;
+
     p.model = RIGID;
+
+	//cout << p.C << " " << replace(p) << " " << redistribute(150,p) << "\n";
 
     while ((ch = getopt_long(argc, argv, "n:m:w:c:CSTPLWYM:", longopts, NULL)) != -1) {
         switch (ch) {
@@ -627,6 +687,8 @@ int main(int argc, char **argv)
                 p.model = RIGID;
             } else if ( startsWith(optarg, "grid") ) {
                 p.model = GRID;
+            } else if ( startsWith(optarg, "abft") ) {
+                p.model = ABFT;
             } else {
                 cerr << "Unknown model type '" << optarg << "' -- ignored" << std::endl;
             }
@@ -653,12 +715,21 @@ int main(int argc, char **argv)
             {
                 int op = p.P;
 
-		/*double d = findMaxY(0.5,p,rigidYield);
-		p.waittime = d;
-		cout << d << " " << rigidYield(findMax(p,rigidYield).first,p) << " " << findMax(p,rigidYield).second << "\n";*/
+		//double d = findMaxY(0.5,p,rigidYield);
+		//cout << d << " " << rigidYield(findMax(p,rigidYield).first,p) << " " << findMax(p,rigidYield).second << "\n";*/
 
-		downtime_opt(p,true);
+		//downtime_opt(p,true);
+
+		cout << rigidTime(0,p) << " " << moldableTime(0,p) << " " << gridTime(0,p) << " " << abftTime(0,p) << "\n";
+		cout << rigidWork(0,p) << " " << moldableWork(0,p) << " " << gridWork(0,p) << " " << abftWork(0,p) << "\n";
+		cout << rigidYield(0,p) << " " << moldableYield(0,p) << " " << gridYield(0,p) << " " << abftYield(0,p) << "\n";
 	
+        assert( fabs(rigidWork(0, p) - moldableWork(0, p)) < 1e-10 );
+	assert( fabs(rigidTime(0,p) - moldableTime(0,p)) < 1e-10);
+        assert( fabs(rigidYield(0, p) - moldableYield(0, p)) < 1e-10);
+        assert( fabs(rigidWork(0, p) - gridWork(0, p)) < 1e-10 );
+	assert( fabs(rigidTime(0,p) - gridTime(0,p)) < 1e-10);
+        assert( fabs(rigidYield(0, p) - gridYield(0, p)) < 1e-10);
 		/*pair<int,double> res = findMax(p,rigidYield);
 		cout << rigidYield(res.first,p) << " " << rigidWork(res.first,p) << " " << rigidTime(res.first,p) << "\n";
 		res = findMax(p,moldableYield);
@@ -670,6 +741,7 @@ int main(int argc, char **argv)
             break;
         case 'n':
             p.P = atoi(optarg);
+		p.C = (p.b*p.b*p.r*p.r*8.0/1024/1024/1024)*p.P/p.BW; //Go / (Go/s) = s
             break;
         case 'm':
             p.MTBF = strtod(optarg, NULL);
